@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>3D Lines — 7x7x2 Prototype</title>
+<style>
+  :root{ --cell-size:46px; --gap:6px; --bg:#111; --panel:#1b1b1b; --muted:#aaa; }
+  html,body{height:100%;margin:0;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;background:linear-gradient(180deg,#0b0b0b,#141414);color:#eee}
+  .wrap{max-width:980px;margin:28px auto;padding:20px;background:linear-gradient(180deg,#0f0f10,#151516);border-radius:10px;box-shadow:0 6px 30px rgba(0,0,0,.6)}
+  h1{margin:0 0 10px;font-size:18px}
+  .topbar{display:flex;gap:12px;align-items:center;margin-bottom:14px}
+  .board-row{display:flex;gap:18px}
+  .layer{background:var(--panel);padding:12px;border-radius:8px;display:inline-block}
+  .layer h3{margin:0 0 10px;font-size:13px;color:var(--muted);text-align:center}
+  .grid{display:grid;grid-template-columns:repeat(7,var(--cell-size));grid-auto-rows:var(--cell-size);gap:var(--gap);padding:6px;background:rgba(255,255,255,0.02);border-radius:6px}
+  .cell{width:var(--cell-size);height:var(--cell-size);border-radius:8px;background:rgba(255,255,255,0.02);display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:inset 0 -2px 0 rgba(0,0,0,.4)}
+  .cell.empty:hover{outline:2px dashed rgba(255,255,255,0.04)}
+  .ball{width:34px;height:34px;border-radius:50%;box-shadow:0 3px 8px rgba(0,0,0,.6), inset 0 -3px 6px rgba(255,255,255,.06);transition:transform .18s}
+  .cell.selected .ball{transform:scale(1.08);box-shadow:0 6px 18px rgba(0,0,0,.6)}
+  .controls{margin-left:auto;display:flex;flex-direction:column;gap:8px;min-width:220px}
+  .info{font-size:13px;color:var(--muted)}
+  .preview{display:flex;gap:8px;align-items:center}
+  .preview .ball{width:26px;height:26px}
+  .btn{background:#222;border:1px solid rgba(255,255,255,0.03);color:#fff;padding:8px 12px;border-radius:8px;cursor:pointer}
+  .score{font-weight:600;font-size:16px}
+  .msg{color:#f88;font-size:13px}
+  .fade{transition:opacity .24s,transform .24s}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <h1>3D Lines — 7×7×2 prototype</h1>
+    <div class="info">Click a ball to select, then click an empty cell to move. Lines of 5+ same color remove. If no removal, 3 new balls spawn.</div>
+    <div class="controls">
+      <div class="score">Score: <span id="score">0</span></div>
+      <div class="preview">Next: <div id="preview" style="display:flex;gap:6px;margin-left:8px"></div></div>
+      <div style="display:flex;gap:8px;margin-top:6px">
+        <button id="reset" class="btn">Reset</button>
+        <button id="push" class="btn">Push to repo (on request)</button>
+      </div>
+      <div class="msg" id="message"></div>
+    </div>
+  </div>
+
+  <div class="board-row">
+    <div class="layer">
+      <h3>Layer 0 (z = 0)</h3>
+      <div id="grid0" class="grid"></div>
+    </div>
+    <div class="layer">
+      <h3>Layer 1 (z = 1)</h3>
+      <div id="grid1" class="grid"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+/*
+  Prototype game logic:
+  - 7x7x2 grid (x:0..6, y:0..6, z:0..1)
+  - Click to select ball, click empty reachable cell to move (BFS in 6 orthogonal directions)
+  - Remove straight lines of length >= 5 along any of 13 unique directions
+  - If no removal, spawn 3 new balls; next preview is shown
+*/
+
+const W = 7, H = 7, L = 2;
+const MIN_LINE = 5;
+const SPAWN_COUNT = 3;
+const COLORS = ['#ff4b4b','#ffd14b','#48ff6b','#4bd7ff','#d24bff','#ffa07a']; // 6 colors
+
+// 3D grid as grid[x][y][z] (null or colorIndex)
+let grid = emptyGrid();
+let score = 0;
+let selected = null; // [x,y,z]
+let preview = []; // upcoming colors
+
+// HTML refs
+const grid0 = document.getElementById('grid0');
+const grid1 = document.getElementById('grid1');
+const scoreEl = document.getElementById('score');
+const previewEl = document.getElementById('preview');
+const msgEl = document.getElementById('message');
+const resetBtn = document.getElementById('reset');
+const pushBtn = document.getElementById('push');
+
+resetBtn.addEventListener('click', init);
+pushBtn.addEventListener('click', ()=>alert('I will push the prototype to the branch when you confirm.'));
+
+function emptyGrid(){
+  const g = Array.from({length:W}, ()=> Array.from({length:H}, ()=> Array(L).fill(null)));
+  return g;
+}
+
+function inBounds(x,y,z){ return x>=0 && x<W && y>=0 && y<H && z>=0 && z<L; }
+
+const orthogonal = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+
+// 13 unique straight directions
+const lineDirs = (() => {
+  const dirs = [];
+  for(let dx=-1; dx<=1; dx++){
+    for(let dy=-1; dy<=1; dy++){
+      for(let dz=-1; dz<=1; dz++){
+        if(dx===0 && dy===0 && dz===0) continue;
+        if(dx>0 || (dx===0 && dy>0) || (dx===0 && dy===0 && dz>0)) dirs.push([dx,dy,dz]);
+      }
+    }
+  }
+  return dirs;
+})();
+
+function init(){
+  grid = emptyGrid();
+  score = 0;
+  selected = null;
+  preview = randomPreview(3);
+  // place a few initial random balls
+  spawnRandom(COLORS.map((v,i)=>i), 7);
+  renderAll();
+  setMessage('');
+}
+function setMessage(m){ msgEl.textContent = m || ''; }
+
+function renderAll(){
+  renderGridLayer(0, grid0);
+  renderGridLayer(1, grid1);
+  renderPreview();
+  scoreEl.textContent = score;
+}
+
+function renderGridLayer(z, container){
+  container.innerHTML = '';
+  for(let y=0;y<H;y++){
+    for(let x=0;x<W;x++){
+      const cell = document.createElement('div');
+      cell.className = 'cell';
+      const val = grid[x][y][z];
+      if(val === null){
+        cell.classList.add('empty');
+      } else {
+        const ball = document.createElement('div');
+        ball.className = 'ball';
+        ball.style.background = COLORS[val];
+        cell.appendChild(ball);
+      }
+      // selected highlight
+      if(selected && selected[0]===x && selected[1]===y && selected[2]===z){
+        cell.classList.add('selected');
+      }
+      // store coords
+      cell.dataset.pos = `${x},${y},${z}`;
+      cell.addEventListener('click', onCellClick);
+      container.appendChild(cell);
+    }
+  }
+}
+
+function renderPreview(){
+  previewEl.innerHTML = '';
+  for(const c of preview){
+    const b = document.createElement('div');
+    b.className = 'ball';
+    b.style.background = COLORS[c];
+    previewEl.appendChild(b);
+  }
+}
+
+function onCellClick(e){
+  const [x,y,z] = e.currentTarget.dataset.pos.split(',').map(n=>parseInt(n,10));
+  const val = grid[x][y][z];
+  if(val !== null){
+    // select this ball
+    selected = [x,y,z];
+    renderAll();
+    setMessage('Selected a ball. Click empty cell to move.');
+    return;
+  }
+  // empty cell clicked
+  if(!selected){
+    setMessage('Click a ball first to select.');
+    return;
+  }
+  const path = findPath(grid, selected, [x,y,z]);
+  if(!path){
+    setMessage('Target not reachable.');
+    return;
+  }
+  // move along path (instant for prototype)
+  const [sx,sy,sz] = selected;
+  const color = grid[sx][sy][sz];
+  grid[sx][sy][sz] = null;
+  grid[x][y][z] = color;
+  selected = null;
+  renderAll();
+  // detect removals
+  const removed = detectAndRemoveLines(grid);
+  if(removed.length){
+    score += removed.length * 10;
+    setMessage(`Removed ${removed.length} balls!`);
+    renderAll();
+    // After removal, do NOT spawn new balls (classic rules).
+  } else {
+    // spawn preview balls
+    const placed = spawnPreview();
+    if(placed.length === 0){
+      setMessage('Game over — no space to spawn.');
+      renderAll();
+    } else {
+      setMessage(`Spawned ${placed.length} balls.`);
+      // after spawning, check automatic removals (chains)
+      const removed2 = detectAndRemoveLines(grid);
+      if(removed2.length){
+        score += removed2.length * 10;
+        setMessage(`Chain removed ${removed2.length} balls!`);
+      }
+      renderAll();
+    }
+  }
+  // check game over
+  if(isBoardFull()){
+    setMessage('Game over — board is full.');
+  }
+}
+
+/* --- BFS pathfinding --- */
+function posKey(p){ return p.join(','); }
+function parseKey(s){ return s.split(',').map(n=>parseInt(n,10)); }
+
+function findPath(grid, src, dst){
+  const [sx,sy,sz] = src, [tx,ty,tz] = dst;
+  if(sx===tx && sy===ty && sz===tz) return [src];
+  const visited = Array.from({length:W}, ()=> Array.from({length:H}, ()=> Array(L).fill(false)));
+  const q = [];
+  q.push([sx,sy,sz]);
+  visited[sx][sy][sz] = true;
+  const parent = new Map();
+  parent.set(posKey([sx,sy,sz]), null);
+  let found = false;
+  while(q.length && !found){
+    const [x,y,z] = q.shift();
+    for(const d of orthogonal){
+      const nx = x + d[0], ny = y + d[1], nz = z + d[2];
+      if(!inBounds(nx,ny,nz)) continue;
+      if(visited[nx][ny][nz]) continue;
+      // can step only on empty target cells (destination may be empty)
+      if(grid[nx][ny][nz] !== null && !(nx===tx && ny===ty && nz===tz)) continue;
+      visited[nx][ny][nz] = true;
+      parent.set(posKey([nx,ny,nz]), posKey([x,y,z]));
+      if(nx===tx && ny===ty && nz===tz){ found = true; break; }
+      q.push([nx,ny,nz]);
+    }
+  }
+  if(!found) return null;
+  // reconstruct
+  const path = [];
+  let k = posKey([tx,ty,tz]);
+  while(k){
+    path.push(parseKey(k));
+    k = parent.get(k);
+  }
+  path.reverse();
+  return path;
+}
+
+/* --- Line detection and removal --- */
+function detectAndRemoveLines(grid){
+  const toRemove = new Set();
+  for(let x=0;x<W;x++){
+    for(let y=0;y<H;y++){
+      for(let z=0;z<L;z++){
+        const c = grid[x][y][z];
+        if(c === null) continue;
+        for(const d of lineDirs){
+          let len = 1;
+          const coords = [[x,y,z]];
+          // forward
+          let nx = x + d[0], ny = y + d[1], nz = z + d[2];
+          while(inBounds(nx,ny,nz) && grid[nx][ny][nz] === c){
+            coords.push([nx,ny,nz]); len++;
+            nx += d[0]; ny += d[1]; nz += d[2];
+          }
+          // backward
+          nx = x - d[0]; ny = y - d[1]; nz = z - d[2];
+          while(inBounds(nx,ny,nz) && grid[nx][ny][nz] === c){
+            coords.push([nx,ny,nz]); len++;
+            nx -= d[0]; ny -= d[1]; nz -= d[2];
+          }
+          if(len >= MIN_LINE){
+            for(const p of coords) toRemove.add(posKey(p));
+          }
+        }
+      }
+    }
+  }
+  const removed = Array.from(toRemove).map(parseKey);
+  for(const k of toRemove){
+    const [x,y,z] = parseKey(k);
+    grid[x][y][z] = null;
+  }
+  return removed;
+}
+
+/* --- Spawning --- */
+function randomPreview(n){
+  const arr = [];
+  for(let i=0;i<n;i++) arr.push(Math.floor(Math.random()*COLORS.length));
+  return arr;
+}
+
+function spawnRandom(colorIndices, n){
+  const empties = [];
+  for(let x=0;x<W;x++) for(let y=0;y<H;y++) for(let z=0;z<L;z++) if(grid[x][y][z]===null) empties.push([x,y,z]);
+  if(empties.length === 0) return [];
+  const placed = [];
+  for(let i=0;i<n && empties.length>0; i++){
+    const idx = Math.floor(Math.random()*empties.length);
+    const cell = empties.splice(idx,1)[0];
+    const color = colorIndices[Math.floor(Math.random()*colorIndices.length)];
+    grid[cell[0]][cell[1]][cell[2]] = color;
+    placed.push({pos:cell, color});
+  }
+  return placed;
+}
+
+function spawnPreview(){
+  const empties = [];
+  for(let x=0;x<W;x++) for(let y=0;y<H;y++) for(let z=0;z<L;z++) if(grid[x][y][z]===null) empties.push([x,y,z]);
+  const placed = [];
+  for(let i=0;i<preview.length && empties.length>0;i++){
+    const idx = Math.floor(Math.random()*empties.length);
+    const cell = empties.splice(idx,1)[0];
+    grid[cell[0]][cell[1]][cell[2]] = preview[i];
+    placed.push({pos:cell,color:preview[i]});
+  }
+  // refresh preview
+  preview = randomPreview(3);
+  return placed;
+}
+
+function isBoardFull(){
+  for(let x=0;x<W;x++) for(let y=0;y<H;y++) for(let z=0;z<L;z++) if(grid[x][y][z]===null) return false;
+  return true;
+}
+
+/* --- helpers for easy setup --- */
+function seedRandom(n=10){
+  const placed = [];
+  const colorIdxs = COLORS.map((c,i)=>i);
+  for(let i=0;i<n;i++){
+    placed.push(...spawnRandom(colorIdxs,1));
+  }
+  return placed;
+}
+
+// start
+init();
+
+// small convenience: seed with a couple additional balls for a fuller start
+seedRandom(4);
+
+</script>
+</body>
+</html>
